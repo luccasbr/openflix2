@@ -1,6 +1,6 @@
 // client-agent.js
 // Roda no A (Cliente). Expõe HTTP CONNECT (127.0.0.1:8080) e SOCKS5 (127.0.0.1:1080)
-// e manda cada conexão por um DataChannel até o Host, com buffer anti-corrida.
+// e manda cada conexão por um DataChannel até o Host, com buffer anti-race.
 // Env vars: ROOM, TOKEN, SIGNAL, SIGNAL_TOKEN, RELAY_ONLY
 const net   = require('net');
 const dgram = require('dgram');
@@ -21,30 +21,26 @@ console.log('[client] START', { ROOM, SIGNAL, RELAY_ONLY: process.env.RELAY_ONLY
 
 const { pc, ensureOffer } = pcFactory(ICE, SIGNAL, 'client', ROOM, process.env.SIGNAL_TOKEN || null);
 
-// ---- util: abrir DC TCP com buffer anti-race e sem renegociar quando já conectado ----
+// ---- abrir DC TCP com buffer anti-race; cria DC ANTES de ofertar p/ incluir SCTP no SDP ----
 function openTcpDC(host, port, timeoutMs = 15000) {
   return new Promise(async (res, rej) => {
-    // Se já estamos conectados, não renegocia: não chama ensureOffer
-    if (!['connecting', 'connected'].includes(pc.connectionState)) {
-      await ensureOffer();
-    }
-
+    // cria o canal primeiro para disparar 'negotiationneeded' (se for a primeira vez)
     const dc = pc.createDataChannel(`tcp-${Date.now()}`, { ordered: true });
     let timer = setTimeout(() => { try { dc.close(); } catch {} ; rej(new Error('timeout-dc-open')); }, timeoutMs);
     dc.binaryType = 'arraybuffer';
 
-    // Buffer para dados que chegarem logo após o ACK, antes do caller plugar o onmessage
+    // infra de buffering (bytes que chegam logo após o ACK)
     dc._pending = [];
     dc._sink = null;
 
+    // 1ª mensagem do host: 0x01 OK / 0x00 FAIL
     const onFirst = (e) => {
       const b = Buffer.from(e.data);
       if (b.length === 1 && b[0] === 1) {
-        // ACK: agora começamos a bufferizar até o caller instalar o handler
+        // ACK -> instala sink e volta
         dc.onmessage = (ev) => {
           const data = Buffer.from(ev.data);
-          if (dc._sink) dc._sink(data);
-          else dc._pending.push(data);
+          if (dc._sink) dc._sink(data); else dc._pending.push(data);
         };
         clearTimeout(timer);
         res(dc);
@@ -53,7 +49,7 @@ function openTcpDC(host, port, timeoutMs = 15000) {
         try { dc.close(); } catch {}
         rej(new Error('dial-fail'));
       } else {
-        // se um servidor MUITO rápido mandar dados junto do ACK (raro), bufferiza também
+        // dados chegaram junto do ACK (raro) -> bufferiza
         dc._pending.push(b);
       }
     };
@@ -63,15 +59,14 @@ function openTcpDC(host, port, timeoutMs = 15000) {
       dc.send(Buffer.from(JSON.stringify({ type: 'tcp-connect', host, port, token: TOKEN })));
     };
     dc.onerror = (err) => { clearTimeout(timer); rej(err); };
+
+    // Se ainda não temos SCTP/remote, dispara oferta agora
+    try { await ensureOffer(); } catch (e) { /* pode já haver negociação em curso via onnegotiationneeded */ }
   });
 }
 
 function openUdpAssocDC(timeoutMs = 15000) {
   return new Promise(async (res, rej) => {
-    if (!['connecting', 'connected'].includes(pc.connectionState)) {
-      await ensureOffer();
-    }
-
     const dc = pc.createDataChannel(`udp-${Date.now()}`, { ordered: true });
     let timer = setTimeout(() => { try { dc.close(); } catch {} ; rej(new Error('timeout-udp-assoc')); }, timeoutMs);
     dc.binaryType = 'arraybuffer';
@@ -80,7 +75,6 @@ function openUdpAssocDC(timeoutMs = 15000) {
       const b = Buffer.from(e.data);
       if (b.length === 1 && b[0] === 1) {
         clearTimeout(timer);
-        // caller pluga seu onmessage depois
         res(dc);
       } else {
         clearTimeout(timer);
@@ -94,6 +88,8 @@ function openUdpAssocDC(timeoutMs = 15000) {
       dc.send(Buffer.from(JSON.stringify({ type: 'udp-assoc', token: TOKEN })));
     };
     dc.onerror = (err) => { clearTimeout(timer); rej(err); };
+
+    try { await ensureOffer(); } catch (e) {}
   });
 }
 
@@ -104,19 +100,15 @@ httpProxy.on('connect', async (req, clientSocket, head) => {
   try {
     const dc = await openTcpDC(host, port, 15000);
 
-    // Instala destino e drena buffer pendente ANTES de responder 200?
-    // Ordem segura: responde 200 (habilita o cliente a falar), envia head (se houver),
-    // e imediatamente drena o que já chegou do servidor.
-    clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
-    if (head && head.length) dc.send(head);
-
-    // Sink para dados vindos do Host
+    // Instala sink E drena o buffer imediatamente
     dc._sink = (data) => { try { clientSocket.write(data); } catch {} };
-    // Drena o que já chegou
     if (dc._pending && dc._pending.length) {
       for (const chunk of dc._pending) { try { clientSocket.write(chunk); } catch {} }
       dc._pending.length = 0;
     }
+
+    clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+    if (head && head.length) dc.send(head);
 
     // Cliente -> Host
     clientSocket.on('data', chunk => { try { dc.send(chunk); } catch {} });
@@ -159,16 +151,16 @@ const socksServer = net.createServer(async (cliSock) => {
 
         try {
           const dc = await openTcpDC(host, port, 15000);
-          // preparar sink + drenar pendentes antes de responder success? No SOCKS, respondemos já:
-          cliSock.write(Buffer.from([0x05, 0x00, 0x00, 0x01, 0,0,0,0, 0,0]));
 
-          // Sink
+          // Sink e dreno de pendentes antes de liberar tráfego
           dc._sink = (data) => { try { cliSock.write(data); } catch {} };
           if (dc._pending && dc._pending.length) {
             for (const chunk of dc._pending) { try { cliSock.write(chunk); } catch {} }
             dc._pending.length = 0;
           }
 
+          // success
+          cliSock.write(Buffer.from([0x05, 0x00, 0x00, 0x01, 0,0,0,0, 0,0]));
           cliSock.on('data', chunk => { try { dc.send(chunk); } catch {} });
           cliSock.on('end',  () => { try { dc.close(); } catch {} });
           cliSock.on('error',() => { try { dc.close(); } catch {} });

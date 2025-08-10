@@ -75,7 +75,7 @@ pc.ondatachannel = (ev) => {
           try { dc.send(Buffer.from([0])); } catch {}
           return closeAll();
         }
-      } catch (err) {
+      } catch {
         console.warn('[host] header inválido');
         try { dc.send(Buffer.from([0])); } catch {}
         return closeAll();
