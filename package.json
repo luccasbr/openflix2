@@ -1,0 +1,20 @@
+{
+  "name": "openflix",
+  "version": "1.0.0",
+  "description": "",
+  "main": "client-agent.js",
+  "directories": {
+    "lib": "lib"
+  },
+  "devDependencies": {},
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "wrtc": "^0.4.7",
+    "ws": "^8.18.3"
+  }
+}

@@ -13,6 +13,9 @@ const ICE = [
 
 const { pc } = pcFactory(ICE, SIGNAL, 'host', ROOM, process.env.SIGNAL_TOKEN || null);
 
+pc.oniceconnectionstatechange = () => console.log('ICE:', pc.iceConnectionState);
+pc.onconnectionstatechange = () => console.log('PC :', pc.connectionState);
+
 pc.ondatachannel = (ev) => {
   const dc = ev.channel;
   dc.binaryType = 'arraybuffer';

@@ -14,6 +14,9 @@ const ICE = [
 
 const { pc, ensureOffer } = pcFactory(ICE, SIGNAL, 'client', ROOM, process.env.SIGNAL_TOKEN || null);
 
+pc.oniceconnectionstatechange = () => console.log('ICE:', pc.iceConnectionState);
+pc.onconnectionstatechange = () => console.log('PC :', pc.connectionState);
+
 // -------- util ----------
 function openTcpDC(host, port){
   return new Promise(async (res, rej) => {
