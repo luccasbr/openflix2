@@ -1,13 +1,13 @@
 // client-agent.js
 // Expõe HTTP CONNECT (127.0.0.1:8080) e SOCKS5 (127.0.0.1:1080) e
-// encaminha via DataChannels. Negocia só uma vez.
+// encaminha via DataChannels. Apenas o CLIENTE negocia.
 const net   = require('net');
 const dgram = require('dgram');
 const http  = require('http');
 const { pcFactory } = require('./lib/webrtc');
 
 const ROOM   = process.env.ROOM   || 'demo1';
-const TOKEN  = process.env.TOKEN  || 'lucas12345'; // enviado no cabeçalho dos canais
+const TOKEN  = process.env.TOKEN  || 'lucas12345';
 const SIGNAL = process.env.SIGNAL || 'wss://signal.loghub.shop/ws';
 
 const ICE = [
@@ -18,16 +18,14 @@ const ICE = [
 
 console.log('[client] START', { ROOM, SIGNAL, RELAY_ONLY: process.env.RELAY_ONLY === '1' });
 
-const { pc, ensureOffer, offeredOnce } = pcFactory(ICE, SIGNAL, 'client', ROOM, 'lucas12345');
+const { pc } = pcFactory(ICE, SIGNAL, 'client', ROOM, 'lucas12345');
 
-// 1) Cria um canal "control" no boot para garantir m-line e manter SCTP aberto.
+// Canal de controle criado uma única vez (garante m-line data no SDP)
 const control = pc.createDataChannel('control', { ordered: true });
-control.onopen = () => console.log('[client] control: open');
+control.onopen  = () => console.log('[client] control: open');
 control.onclose = () => console.log('[client] control: close');
-// dispara oferta inicial se ainda não negociado
-ensureOffer().catch(()=>{});
 
-// ---------- util: abrir DataChannel TCP sem renegociar ----------
+// ---------- util: abrir DataChannel TCP ----------
 function openTcpDC(host, port, timeoutMs = 15000) {
   return new Promise((res, rej) => {
     const dc = pc.createDataChannel(`tcp-${Date.now()}`, { ordered: true });
@@ -171,6 +169,5 @@ const socksServer = net.createServer(async (cliSock) => {
 });
 socksServer.listen(1080, '127.0.0.1', () => console.log('[client] SOCKS5 em 127.0.0.1:1080'));
 
-// Proteção contra quedas
 process.on('uncaughtException', (e) => console.error('[client] uncaught', e));
 process.on('unhandledRejection', (e) => console.error('[client] unhandled', e));

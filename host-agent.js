@@ -1,11 +1,10 @@
 // host-agent.js
-// Roda na casa do B (Host). Recebe DataChannels e disca TCP/UDP pra internet local.
 const net   = require('net');
 const dgram = require('dgram');
 const { pcFactory } = require('./lib/webrtc');
 
 const ROOM   = process.env.ROOM   || 'demo1';
-const TOKEN  = process.env.TOKEN  || 'lucas12345'; // o Client deve enviar esse token no cabeçalho do canal
+const TOKEN  = process.env.TOKEN  || 'lucas12345';
 const SIGNAL = process.env.SIGNAL || 'wss://signal.loghub.shop/ws';
 
 const ICE = [
@@ -38,24 +37,15 @@ pc.ondatachannel = (ev) => {
     if (mode === 'header') {
       try {
         const h = JSON.parse(buf.toString('utf8'));
-        if (h?.type === 'tcp-connect' || h?.type === 'udp-assoc') {
-          if (TOKEN && h.token !== TOKEN) {
-            console.warn('[host] token inválido');
-            try { dc.send(Buffer.from([0])); } catch {}
-            return closeAll();
-          }
+        if ((h?.type === 'tcp-connect' || h?.type === 'udp-assoc') && process.env.TOKEN && h.token !== process.env.TOKEN) {
+          console.warn('[host] token inválido');
+          try { dc.send(Buffer.from([0])); } catch {} ; return closeAll();
         }
 
         if (h.type === 'tcp-connect') {
           console.log('[host] tcp-connect =>', h.host, h.port);
-          tcp = net.connect({ host: h.host, port: Number(h.port) }, () => {
-            try { dc.send(Buffer.from([1])); } catch {}
-          });
-          tcp.setTimeout(15000, () => {
-            console.warn('[host] tcp timeout');
-            try { dc.send(Buffer.from([0])); } catch {}
-            return closeAll();
-          });
+          tcp = net.connect({ host: h.host, port: Number(h.port) }, () => { try { dc.send(Buffer.from([1])); } catch {} });
+          tcp.setTimeout(15000, () => { console.warn('[host] tcp timeout'); try { dc.send(Buffer.from([0])); } catch {} ; return closeAll(); });
           tcp.on('data', chunk => { try { dc.send(chunk); } catch {} });
           tcp.on('error', err => { console.warn('[host] tcp error:', err.message); try { dc.send(Buffer.from([0])); } catch {} ; closeAll(); });
           tcp.on('close', () => { try { dc.close(); } catch {} });
@@ -72,23 +62,18 @@ pc.ondatachannel = (ev) => {
           mode = 'udp';
 
         } else {
-          // Pode ser um DataChannel "control" do cliente (sem header).
-          // Ignore e feche, para não acumular canais.
           console.log('[host] canal sem header conhecido; fechando');
-          try { dc.send(Buffer.from([0])); } catch {}
-          return closeAll();
+          try { dc.send(Buffer.from([0])); } catch {} ; return closeAll();
         }
       } catch {
         console.warn('[host] header inválido; fechando canal');
-        try { dc.send(Buffer.from([0])); } catch {}
-        return closeAll();
+        try { dc.send(Buffer.from([0])); } catch {} ; return closeAll();
       }
       return;
     }
 
     if (mode === 'tcp' && tcp) {
-      tcp.write(buf);
-      return;
+      tcp.write(buf); return;
     }
 
     if (mode === 'udp' && udpSock) {
