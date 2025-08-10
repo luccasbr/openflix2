@@ -1,46 +1,57 @@
-// client.js — expõe HTTP CONNECT e (opcional) SOCKS5 locais e usa 1 PeerConnection persistente.
+// client.js – proxy HTTP CONNECT local -> DataChannels -> Host.
 // Execução: ROOM=demo1 SIGNAL=wss://signal.loghub.shop/ws node client.js
+
 const http = require('http');
-const net = require('net');
 const WebSocket = require('ws');
 const wrtc = require('wrtc');
 
 const ROOM   = process.env.ROOM   || 'demo1';
 const SIGNAL = process.env.SIGNAL || 'wss://signal.loghub.shop/ws';
-const RELAY  = process.env.RELAY_ONLY === '1'; // se quiser forçar TURN
+const RELAY  = process.env.RELAY_ONLY === '1';
 
-// Ajuste seus ICE servers
 const ICE = {
   iceServers: [
     { urls: 'stun:turn.loghub.shop:3478' },
-    { urls: 'turn:turn.loghub.shop:3478?transport=udp' },
-    { urls: 'turns:turn.loghub.shop:5349?transport=tcp' },
+    { urls: 'turn:turn.loghub.shop:3478?transport=udp',  username: 'api', credential: 'senha-super-secreta' },
+    { urls: 'turns:turn.loghub.shop:5349?transport=tcp', username: 'api', credential: 'senha-super-secreta' },
   ],
   iceTransportPolicy: RELAY ? 'relay' : 'all',
 };
 
-let pc;
-let ws;
-let linkReady = false;
+let ws, pc, ctrl, linkReady = false;
 
-function resetPC() {
-  if (pc) { try { pc.close(); } catch {} }
-  pc = new wrtc.RTCPeerConnection(ICE);
+function newPeerConnection() {
+  const pc = new wrtc.RTCPeerConnection(ICE);
+
   pc.oniceconnectionstatechange = () => console.log('[client] ICE:', pc.iceConnectionState);
   pc.onconnectionstatechange   = () => {
     console.log('[client] PC :', pc.connectionState);
     linkReady = (pc.connectionState === 'connected');
+    if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+      // reconectar de forma simples
+      setTimeout(() => { try { pc.close(); } catch {}; setupAndOffer(); }, 300);
+    }
   };
   pc.onicecandidate = ({ candidate }) => {
-    if (candidate) ws && ws.send(JSON.stringify({ type: 'signal', data: { candidate } }));
+    if (candidate && ws && ws.readyState === 1) {
+      ws.send(JSON.stringify({ type: 'signal', data: { candidate } }));
+    }
   };
+
+  // Cria canal de controle para manter a sessão viva
+  ctrl = pc.createDataChannel('ctrl', { ordered: true });
+  ctrl.onopen = () => {
+    console.log('[client] ctrl open');
+    // keep-alive a cada 10s
+    ctrl._ka = setInterval(() => { try { ctrl.send('ping'); } catch {} }, 10000);
+  };
+  ctrl.onclose = () => { if (ctrl && ctrl._ka) clearInterval(ctrl._ka); };
+
+  return pc;
 }
 
-async function ensureLinked() {
-  if (linkReady) return;
-  if (!ws || ws.readyState !== 1) throw new Error('signaling not ready');
-  if (pc.signalingState !== 'stable') return; // já ofereceu; aguarde
-
+async function offerIfStable() {
+  if (pc.signalingState !== 'stable') return;
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
   ws.send(JSON.stringify({ type: 'signal', data: { sdp: pc.localDescription } }));
@@ -48,7 +59,6 @@ async function ensureLinked() {
 
 async function waitConnected(timeoutMs = 15000) {
   if (linkReady) return;
-  await ensureLinked();
   const t0 = Date.now();
   while (!linkReady && Date.now() - t0 < timeoutMs) {
     await new Promise(r => setTimeout(r, 50));
@@ -56,54 +66,38 @@ async function waitConnected(timeoutMs = 15000) {
   if (!linkReady) throw new Error('webrtc not connected');
 }
 
-function makeTcpDC(host, port, timeoutMs = 15000) {
-  return new Promise(async (resolve, reject) => {
-    try { await waitConnected(timeoutMs); } catch (e) { return reject(e); }
-
-    const dc = pc.createDataChannel(`tcp-${Date.now()}`, { ordered: true });
-    let timer = setTimeout(() => { try { dc.close(); } catch {}; reject(new Error('dc-timeout')); }, timeoutMs);
-
-    dc.binaryType = 'arraybuffer';
-    dc.onopen = () => {
-      const hdr = Buffer.from(JSON.stringify({ type: 'tcp-connect', host, port }));
-      dc.send(hdr);
-    };
-    dc.onmessage = (e) => {
-      const b = Buffer.from(e.data);
-      if (b.length === 1 && b[0] === 1) { clearTimeout(timer); dc.onmessage = null; return resolve(dc); } // ACK
-      if (b.length === 1 && b[0] === 0) { clearTimeout(timer); try { dc.close(); } catch {}; return reject(new Error('dial-fail')); }
-      // Qualquer outro payload antes de ACK é inesperado; ignore.
-    };
-    dc.onerror = (err) => { clearTimeout(timer); reject(err); };
-  });
+function setupAndOffer() {
+  pc = newPeerConnection();
+  offerIfStable().catch(e => console.error('[client] offer err', e.message));
 }
 
 function wireSignaling() {
   ws = new WebSocket(SIGNAL);
   ws.on('open', () => {
     ws.send(JSON.stringify({ type: 'join', role: 'client', room: ROOM }));
-    resetPC(); // cria o PC e se prepara para oferecer
+    setupAndOffer(); // oferece já; se o host ainda não entrou, faremos outra offer quando ele entrar
   });
 
   ws.on('message', async (raw) => {
     let m; try { m = JSON.parse(raw); } catch { return; }
     if (m.type === 'peer-ready') {
-      // Host entrou depois — faça a offer
-      try { await ensureLinked(); } catch (e) { console.error('[client] ensureLinked:', e.message); }
+      // host entrou depois — ofereça de novo
+      offerIfStable().catch(()=>{});
+      return;
     }
-    if (m.type === 'signal') {
-      try {
-        const data = m.data || {};
-        if (data.sdp) {
-          await pc.setRemoteDescription(new wrtc.RTCSessionDescription(data.sdp));
-          // Se recebemos ANSWER, beleza; se recebêssemos OFFER (improvável do lado client), criaríamos ANSWER — mas nosso servidor só envia offer->host.
-        }
-        if (data.candidate) {
-          await pc.addIceCandidate(new wrtc.RTCIceCandidate(data.candidate));
-        }
-      } catch (e) {
-        console.error('[client] sinalização erro:', e.message);
+    if (m.type !== 'signal') return;
+
+    const data = m.data || {};
+    try {
+      if (data.sdp) {
+        await pc.setRemoteDescription(new wrtc.RTCSessionDescription(data.sdp));
+        // depois de ANSWER, aguardamos ICE completar
       }
+      if (data.candidate) {
+        await pc.addIceCandidate(new wrtc.RTCIceCandidate(data.candidate));
+      }
+    } catch (e) {
+      console.error('[client] sinalização erro:', e.message);
     }
   });
 
@@ -111,21 +105,50 @@ function wireSignaling() {
   ws.on('error', (e) => console.error('[client] WS erro:', e.message));
 }
 
-// ---------- HTTP CONNECT local (HTTPS) ----------
+// ------- Proxy HTTP CONNECT (127.0.0.1:8080) -------
 const httpProxy = http.createServer();
 httpProxy.on('connect', async (req, clientSocket, head) => {
   const [host, portStr] = req.url.split(':'); const port = Number(portStr || 443);
+
+  // abre um DC novo por conexão
   try {
-    const dc = await makeTcpDC(host, port, 20000);
-    clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
-    if (head && head.length) dc.send(head);
+    await waitConnected(20000);
+    const dc = pc.createDataChannel(`tcp-${Date.now()}`, { ordered: true });
+    let acked = false;
+    let timer = setTimeout(() => { if (!acked) { try { dc.close(); } catch {} ; try { clientSocket.end(); } catch {} } }, 20000);
+
+    dc.binaryType = 'arraybuffer';
+    dc.onopen = () => {
+      const hdr = Buffer.from(JSON.stringify({ type: 'tcp-connect', host, port }));
+      dc.send(hdr);
+    };
+
+    dc.onmessage = (e) => {
+      const b = Buffer.from(e.data);
+      if (!acked) {
+        if (b.length === 1 && b[0] === 1) {
+          acked = true; clearTimeout(timer);
+          clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+          if (head && head.length) dc.send(head);
+          return;
+        } else if (b.length === 1 && b[0] === 0) {
+          clearTimeout(timer);
+          try { clientSocket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n'); } catch {}
+          try { clientSocket.end(); } catch {}
+          try { dc.close(); } catch {}
+          return;
+        }
+      } else {
+        try { clientSocket.write(b); } catch {}
+      }
+    };
 
     clientSocket.on('data',  (chunk) => { try { dc.send(chunk); } catch {} });
     clientSocket.on('end',   () => { try { dc.close(); } catch {} });
     clientSocket.on('error', () => { try { dc.close(); } catch {} });
-
-    dc.onmessage = (e) => { try { clientSocket.write(Buffer.from(e.data)); } catch {} };
     dc.onclose   = () => { try { clientSocket.end(); } catch {} };
+    dc.onerror   = () => { try { clientSocket.end(); } catch {} };
+
   } catch (e) {
     try { clientSocket.write('HTTP/1.1 504 Gateway Timeout\r\n\r\n'); } catch {}
     try { clientSocket.end(); } catch {}
@@ -134,43 +157,8 @@ httpProxy.on('connect', async (req, clientSocket, head) => {
 httpProxy.on('clientError', (err, socket) => { try { socket.end('HTTP/1.1 400 Bad Request\r\n\r\n'); } catch {} });
 httpProxy.listen(8080, '127.0.0.1', () => console.log('[client] HTTP CONNECT em 127.0.0.1:8080'));
 
-// ---------- (Opcional) SOCKS5 local para DNS remoto ----------
-const socksServer = net.createServer((cliSock) => {
-  cliSock.once('data', async (hello) => {
-    if (hello[0] !== 0x05) { cliSock.destroy(); return; }              // VER=5
-    cliSock.write(Buffer.from([0x05, 0x00]));                          // METHOD: no auth
-
-    cliSock.once('data', async (req1) => {
-      const ver=req1[0], cmd=req1[1], atyp=req1[3];
-      if (ver!==0x05 || cmd!==0x01) { // CONNECT only (sem UDP no simplificado)
-        cliSock.end(Buffer.from([0x05,0x07,0x00,0x01,0,0,0,0,0,0]));
-        return;
-      }
-
-      let host, port, p=4;
-      if (atyp===0x01){ host=req1.slice(p,p+4).join('.'); p+=4; }
-      else if (atyp===0x03){ const len=req1[p]; p+=1; host=req1.slice(p,p+len).toString('utf8'); p+=len; }
-      else if (atyp===0x04){ host='['+req1.slice(p,p+16).toString('hex')+']'; p+=16; }
-      port = (req1[p]<<8) | req1[p+1];
-
-      try {
-        const dc = await makeTcpDC(host, port, 20000);
-        cliSock.write(Buffer.from([0x05,0x00,0x00,0x01,0,0,0,0,0,0])); // success
-        cliSock.on('data',  (chunk)=>{ try{ dc.send(chunk); }catch{} });
-        cliSock.on('end',   ()=>{ try{ dc.close(); }catch{} });
-        cliSock.on('error', ()=>{ try{ dc.close(); }catch{} });
-        dc.onmessage = (e)=>{ try{ cliSock.write(Buffer.from(e.data)); }catch{} };
-        dc.onclose   = ()=>{ try{ cliSock.end(); }catch{} };
-      } catch {
-        cliSock.end(Buffer.from([0x05,0x01,0x00,0x01,0,0,0,0,0,0]));   // general failure
-      }
-    });
-  });
-});
-socksServer.listen(1080, '127.0.0.1', () => console.log('[client] SOCKS5 em 127.0.0.1:1080'));
-
 wireSignaling();
 
-// Evitar derrubar o processo
+// Evitar quedas
 process.on('uncaughtException', (e) => console.error('[client] uncaught', e));
 process.on('unhandledRejection', (e) => console.error('[client] unhandled', e));

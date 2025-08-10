@@ -1,5 +1,6 @@
-// host.js — recebe DataChannels e disca TCP via internet do Host.
+// host.js – recebe DataChannels e disca TCP via internet do Host.
 // Execução: ROOM=demo1 SIGNAL=wss://signal.loghub.shop/ws node host.js
+
 const net = require('net');
 const WebSocket = require('ws');
 const wrtc = require('wrtc');
@@ -7,29 +8,40 @@ const wrtc = require('wrtc');
 const ROOM   = process.env.ROOM   || 'demo1';
 const SIGNAL = process.env.SIGNAL || 'wss://signal.loghub.shop/ws';
 
-// Ajuste seus ICE servers (sem auth p/ simplificar; use os seus)
+// ATENÇÃO: mantenha as credenciais do seu TURN aqui (as mesmas do coturn)
 const ICE = {
   iceServers: [
     { urls: 'stun:turn.loghub.shop:3478' },
-    { urls: 'turn:turn.loghub.shop:3478?transport=udp' },
-    { urls: 'turns:turn.loghub.shop:5349?transport=tcp' },
+    { urls: 'turn:turn.loghub.shop:3478?transport=udp',  username: 'api', credential: 'senha-super-secreta' },
+    { urls: 'turns:turn.loghub.shop:5349?transport=tcp', username: 'api', credential: 'senha-super-secreta' },
   ],
 };
 
-function makePC(ws) {
+let ws, pc;
+
+function newPeerConnection() {
   const pc = new wrtc.RTCPeerConnection(ICE);
 
   pc.oniceconnectionstatechange = () => console.log('[host] ICE:', pc.iceConnectionState);
   pc.onconnectionstatechange   = () => console.log('[host] PC :', pc.connectionState);
-
   pc.onicecandidate = ({ candidate }) => {
-    if (candidate) ws.send(JSON.stringify({ type: 'signal', data: { candidate } }));
+    if (candidate && ws && ws.readyState === 1) {
+      ws.send(JSON.stringify({ type: 'signal', data: { candidate } }));
+    }
   };
 
+  // Recebe canais
   pc.ondatachannel = (ev) => {
     const dc = ev.channel;
     dc.binaryType = 'arraybuffer';
 
+    // Canal de controle (mantém a ligação viva)
+    if (dc.label === 'ctrl') {
+      dc.onmessage = () => {}; // pode responder ping/pong se quiser
+      return;
+    }
+
+    // Qualquer outro canal: espera cabeçalho {type:'tcp-connect', host, port}
     let stage = 'header';
     let tcp = null;
 
@@ -47,10 +59,9 @@ function makePC(ws) {
             try { dc.send(Buffer.from([1])); } catch {}
           });
           tcp.setTimeout(20000, () => { try { dc.send(Buffer.from([0])); } catch {}; cleanup(); });
-          tcp.on('data',   (chunk) => { try { dc.send(chunk); } catch {} });
-          tcp.on('error',  () => { try { dc.send(Buffer.from([0])); } catch {}; cleanup(); });
-          tcp.on('close',  () => cleanup());
-
+          tcp.on('data',  (chunk) => { try { dc.send(chunk); } catch {} });
+          tcp.on('error', () => { try { dc.send(Buffer.from([0])); } catch {}; cleanup(); });
+          tcp.on('close', () => cleanup());
           stage = 'pipe';
         } catch {
           try { dc.send(Buffer.from([0])); } catch {}
@@ -58,33 +69,38 @@ function makePC(ws) {
         }
         return;
       }
-
-      if (stage === 'pipe' && tcp) {
-        tcp.write(buf);
-      }
+      if (stage === 'pipe' && tcp) tcp.write(buf);
     };
 
     dc.onclose = cleanup;
-    dc.onerror = () => cleanup;
+    dc.onerror = () => cleanup();
   };
 
   return pc;
 }
 
-function main() {
+function start() {
   console.log('[host] START', { ROOM, SIGNAL });
-  const ws = new WebSocket(SIGNAL);
+  ws = new WebSocket(SIGNAL);
 
-  let pc = makePC(ws);
+  pc = newPeerConnection();
 
-  ws.on('open', () => ws.send(JSON.stringify({ type: 'join', role: 'host', room: ROOM })));
+  ws.on('open', () => {
+    ws.send(JSON.stringify({ type: 'join', role: 'host', room: ROOM }));
+  });
+
   ws.on('message', async (raw) => {
     let m; try { m = JSON.parse(raw); } catch { return; }
     if (m.type !== 'signal') return;
 
+    const data = m.data || {};
     try {
-      const data = m.data || {};
       if (data.sdp) {
+        // Se o PC travar, recria antes de aceitar nova oferta
+        if (data.sdp.type === 'offer' && pc.signalingState !== 'stable') {
+          try { pc.close(); } catch {}
+          pc = newPeerConnection();
+        }
         await pc.setRemoteDescription(new wrtc.RTCSessionDescription(data.sdp));
         if (data.sdp.type === 'offer') {
           const ans = await pc.createAnswer();
@@ -104,4 +120,4 @@ function main() {
   ws.on('error', (e) => console.error('[host] WS erro:', e.message));
 }
 
-main();
+start();
