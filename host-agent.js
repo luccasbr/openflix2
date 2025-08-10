@@ -27,7 +27,6 @@ pc.ondatachannel = (ev) => {
   let tcp = null;
   let udpSock = null;
 
-  // util: fecha tudo com calma
   const closeAll = () => {
     try { dc.close(); } catch {}
     try { tcp && tcp.destroy(); } catch {}
@@ -51,7 +50,7 @@ pc.ondatachannel = (ev) => {
           tcp = net.connect({ host: h.host, port: Number(h.port) }, () => {
             try { dc.send(Buffer.from([1])); } catch {}
           });
-          tcp.setTimeout(15000, () => { // timeout de conexão/ocioso
+          tcp.setTimeout(15000, () => {
             console.warn('[host] tcp timeout');
             try { dc.send(Buffer.from([0])); } catch {}
             return closeAll();
@@ -63,9 +62,8 @@ pc.ondatachannel = (ev) => {
 
         } else if (h.type === 'udp-assoc') {
           console.log('[host] udp-assoc');
-          udpSock = dgram.createSocket('udp4'); // simples (IPv4)
+          udpSock = dgram.createSocket('udp4');
           udpSock.on('message', (msg, rinfo) => {
-            // devolve pro cliente: {rhost,rport,data}
             const payload = JSON.stringify({ rhost: rinfo.address, rport: rinfo.port, data: msg.toString('base64') });
             try { dc.send(Buffer.from(payload)); } catch {}
           });
@@ -86,13 +84,11 @@ pc.ondatachannel = (ev) => {
     }
 
     if (mode === 'tcp' && tcp) {
-      // bytes do cliente -> destino
       tcp.write(buf);
       return;
     }
 
     if (mode === 'udp' && udpSock) {
-      // JSON {rhost, rport, data(base64)} vindo do cliente
       try {
         const m = JSON.parse(buf.toString('utf8'));
         const data = Buffer.from(m.data, 'base64');
@@ -105,6 +101,6 @@ pc.ondatachannel = (ev) => {
   dc.onerror = (e) => { console.warn('[host] dc error:', e && e.message); closeAll(); };
 };
 
-// proteção contra quedas
+// proteção
 process.on('uncaughtException', (e) => console.error('[host] uncaught', e));
 process.on('unhandledRejection', (e) => console.error('[host] unhandled', e));

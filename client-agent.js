@@ -1,6 +1,6 @@
 // client-agent.js
 // Roda no A (Cliente). Expõe HTTP CONNECT (127.0.0.1:8080) e SOCKS5 (127.0.0.1:1080)
-// e manda cada conexão por um DataChannel até o Host.
+// e manda cada conexão por um DataChannel até o Host, com buffer anti-corrida.
 // Env vars: ROOM, TOKEN, SIGNAL, SIGNAL_TOKEN, RELAY_ONLY
 const net   = require('net');
 const dgram = require('dgram');
@@ -21,40 +21,79 @@ console.log('[client] START', { ROOM, SIGNAL, RELAY_ONLY: process.env.RELAY_ONLY
 
 const { pc, ensureOffer } = pcFactory(ICE, SIGNAL, 'client', ROOM, process.env.SIGNAL_TOKEN || null);
 
-// ---------- util: abrir um DataChannel para TCP (com timeout) ----------
+// ---- util: abrir DC TCP com buffer anti-race e sem renegociar quando já conectado ----
 function openTcpDC(host, port, timeoutMs = 15000) {
   return new Promise(async (res, rej) => {
+    // Se já estamos conectados, não renegocia: não chama ensureOffer
+    if (!['connecting', 'connected'].includes(pc.connectionState)) {
+      await ensureOffer();
+    }
+
     const dc = pc.createDataChannel(`tcp-${Date.now()}`, { ordered: true });
     let timer = setTimeout(() => { try { dc.close(); } catch {} ; rej(new Error('timeout-dc-open')); }, timeoutMs);
     dc.binaryType = 'arraybuffer';
+
+    // Buffer para dados que chegarem logo após o ACK, antes do caller plugar o onmessage
+    dc._pending = [];
+    dc._sink = null;
+
+    const onFirst = (e) => {
+      const b = Buffer.from(e.data);
+      if (b.length === 1 && b[0] === 1) {
+        // ACK: agora começamos a bufferizar até o caller instalar o handler
+        dc.onmessage = (ev) => {
+          const data = Buffer.from(ev.data);
+          if (dc._sink) dc._sink(data);
+          else dc._pending.push(data);
+        };
+        clearTimeout(timer);
+        res(dc);
+      } else if (b.length === 1 && b[0] === 0) {
+        clearTimeout(timer);
+        try { dc.close(); } catch {}
+        rej(new Error('dial-fail'));
+      } else {
+        // se um servidor MUITO rápido mandar dados junto do ACK (raro), bufferiza também
+        dc._pending.push(b);
+      }
+    };
+
     dc.onopen = () => {
+      dc.onmessage = onFirst;
       dc.send(Buffer.from(JSON.stringify({ type: 'tcp-connect', host, port, token: TOKEN })));
     };
-    const first = (e) => {
-      const b = Buffer.from(e.data);
-      if (b.length === 1 && b[0] === 1) { clearTimeout(timer); dc.removeEventListener('message', first); res(dc); }
-      else if (b.length === 1 && b[0] === 0) { clearTimeout(timer); try { dc.close(); } catch {} ; rej(new Error('dial-fail')); }
-    };
-    dc.onmessage = first;
     dc.onerror = (err) => { clearTimeout(timer); rej(err); };
-    await ensureOffer();
   });
 }
 
 function openUdpAssocDC(timeoutMs = 15000) {
   return new Promise(async (res, rej) => {
+    if (!['connecting', 'connected'].includes(pc.connectionState)) {
+      await ensureOffer();
+    }
+
     const dc = pc.createDataChannel(`udp-${Date.now()}`, { ordered: true });
     let timer = setTimeout(() => { try { dc.close(); } catch {} ; rej(new Error('timeout-udp-assoc')); }, timeoutMs);
     dc.binaryType = 'arraybuffer';
-    dc.onopen = () => { dc.send(Buffer.from(JSON.stringify({ type: 'udp-assoc', token: TOKEN }))); };
-    const first = (e) => {
+
+    const onFirst = (e) => {
       const b = Buffer.from(e.data);
-      if (b.length === 1 && b[0] === 1) { clearTimeout(timer); dc.removeEventListener('message', first); res(dc); }
-      else if (b.length === 1 && b[0] === 0) { clearTimeout(timer); try { dc.close(); } catch {} ; rej(new Error('udp-assoc-fail')); }
+      if (b.length === 1 && b[0] === 1) {
+        clearTimeout(timer);
+        // caller pluga seu onmessage depois
+        res(dc);
+      } else {
+        clearTimeout(timer);
+        try { dc.close(); } catch {}
+        rej(new Error('udp-assoc-fail'));
+      }
     };
-    dc.onmessage = first;
+
+    dc.onopen = () => {
+      dc.onmessage = onFirst;
+      dc.send(Buffer.from(JSON.stringify({ type: 'udp-assoc', token: TOKEN })));
+    };
     dc.onerror = (err) => { clearTimeout(timer); rej(err); };
-    await ensureOffer();
   });
 }
 
@@ -64,13 +103,29 @@ httpProxy.on('connect', async (req, clientSocket, head) => {
   const [host, portStr] = req.url.split(':'); const port = Number(portStr || 443);
   try {
     const dc = await openTcpDC(host, port, 15000);
+
+    // Instala destino e drena buffer pendente ANTES de responder 200?
+    // Ordem segura: responde 200 (habilita o cliente a falar), envia head (se houver),
+    // e imediatamente drena o que já chegou do servidor.
     clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
     if (head && head.length) dc.send(head);
-    clientSocket.on('data', (chunk) => { try { dc.send(chunk); } catch {} });
+
+    // Sink para dados vindos do Host
+    dc._sink = (data) => { try { clientSocket.write(data); } catch {} };
+    // Drena o que já chegou
+    if (dc._pending && dc._pending.length) {
+      for (const chunk of dc._pending) { try { clientSocket.write(chunk); } catch {} }
+      dc._pending.length = 0;
+    }
+
+    // Cliente -> Host
+    clientSocket.on('data', chunk => { try { dc.send(chunk); } catch {} });
     clientSocket.on('end',  () => { try { dc.close(); } catch {} });
     clientSocket.on('error',() => { try { dc.close(); } catch {} });
-    dc.onmessage = (e) => { try { clientSocket.write(Buffer.from(e.data)); } catch {} };
-    dc.onclose   = () => { try { clientSocket.end(); } catch {} };
+
+    // Se o DC fechar, fechamos o socket
+    dc.onclose = () => { try { clientSocket.end(); } catch {} };
+
   } catch (e) {
     try { clientSocket.write('HTTP/1.1 504 Gateway Timeout\r\n\r\n'); } catch {}
     try { clientSocket.end(); } catch {}
@@ -85,19 +140,17 @@ httpProxy.listen(8080, '127.0.0.1', () => console.log('[client] HTTP CONNECT em 
 const socksServer = net.createServer(async (cliSock) => {
   cliSock.once('data', async (hello) => {
     if (hello[0] !== 0x05) { cliSock.destroy(); return; }
-    // NoAuth (MVP). Se quiser, implemente username/password (RFC 1929).
-    cliSock.write(Buffer.from([0x05, 0x00]));
+    cliSock.write(Buffer.from([0x05, 0x00])); // NoAuth (MVP)
 
     cliSock.once('data', async (req1) => {
       const ver = req1[0], cmd = req1[1], atyp = req1[3];
       if (ver !== 0x05 || (cmd !== 0x01 && cmd !== 0x03)) {
-        // 0x01 CONNECT, 0x03 UDP ASSOC
         cliSock.end(Buffer.from([0x05, 0x07, 0x00, 0x01, 0,0,0,0, 0,0]));
         return;
       }
 
       if (cmd === 0x01) {
-        // ------- CONNECT (TCP) -------
+        // CONNECT (TCP)
         let host, port, p = 4;
         if (atyp === 0x01) { host = req1.slice(p, p+4).join('.'); p += 4; }
         else if (atyp === 0x03) { const len=req1[p]; p += 1; host = req1.slice(p, p+len).toString('utf8'); p += len; }
@@ -106,19 +159,27 @@ const socksServer = net.createServer(async (cliSock) => {
 
         try {
           const dc = await openTcpDC(host, port, 15000);
-          // success
+          // preparar sink + drenar pendentes antes de responder success? No SOCKS, respondemos já:
           cliSock.write(Buffer.from([0x05, 0x00, 0x00, 0x01, 0,0,0,0, 0,0]));
+
+          // Sink
+          dc._sink = (data) => { try { cliSock.write(data); } catch {} };
+          if (dc._pending && dc._pending.length) {
+            for (const chunk of dc._pending) { try { cliSock.write(chunk); } catch {} }
+            dc._pending.length = 0;
+          }
+
           cliSock.on('data', chunk => { try { dc.send(chunk); } catch {} });
           cliSock.on('end',  () => { try { dc.close(); } catch {} });
           cliSock.on('error',() => { try { dc.close(); } catch {} });
-          dc.onmessage = (e) => { try { cliSock.write(Buffer.from(e.data)); } catch {} };
-          dc.onclose   = () => { try { cliSock.end(); } catch {} };
+          dc.onclose = () => { try { cliSock.end(); } catch {} };
+
         } catch (e) {
           cliSock.end(Buffer.from([0x05, 0x01, 0x00, 0x01, 0,0,0,0, 0,0])); // general failure
         }
 
       } else if (cmd === 0x03) {
-        // ------- UDP ASSOCIATE -------
+        // UDP ASSOC
         try {
           const dc = await openUdpAssocDC(15000);
           const udpLocal = dgram.createSocket('udp4');
@@ -126,7 +187,6 @@ const socksServer = net.createServer(async (cliSock) => {
 
           udpLocal.on('message', (msg, rinfo) => {
             clientAddr = rinfo.address; clientPort = rinfo.port;
-            // RFC 1928: RSV(2) FRAG(1) ATYP(1) DST.ADDR DST.PORT DATA
             if (msg[2] !== 0x00) return; // sem fragmentação
             const atyp = msg[3];
             if (atyp === 0x01) {
@@ -140,8 +200,6 @@ const socksServer = net.createServer(async (cliSock) => {
               const port = (msg[5+len]<<8) | msg[6+len];
               const data = msg.slice(7+len);
               dc.send(Buffer.from(JSON.stringify({ rhost: host, rport: port, data: data.toString('base64') })));
-            } else {
-              // IPv6 não implementado no MVP
             }
           });
 
@@ -149,7 +207,6 @@ const socksServer = net.createServer(async (cliSock) => {
             try {
               const m = JSON.parse(Buffer.from(e.data).toString('utf8'));
               if (!clientAddr) return;
-              // Monta pacote SOCKS5-UDP de volta (usamos ATYP=domínio pra simplicidade)
               const hostBuf = Buffer.from(m.rhost, 'utf8');
               const hdr = Buffer.from([0x00,0x00,0x00, 0x03, hostBuf.length, ...hostBuf]);
               const portBuf = Buffer.from([ (m.rport>>8)&0xff, m.rport&0xff ]);
@@ -161,7 +218,6 @@ const socksServer = net.createServer(async (cliSock) => {
 
           udpLocal.bind(0, '127.0.0.1', () => {
             const addr = udpLocal.address();
-            // success: bound local UDP
             const rep = Buffer.from([0x05,0x00,0x00,0x01, 127,0,0,1, (addr.port>>8)&0xff, addr.port&0xff ]);
             cliSock.write(rep);
             cliSock.on('close', () => { try { udpLocal.close(); } catch {} ; try { dc.close(); } catch {} });
@@ -176,6 +232,6 @@ const socksServer = net.createServer(async (cliSock) => {
 });
 socksServer.listen(1080, '127.0.0.1', () => console.log('[client] SOCKS5 em 127.0.0.1:1080'));
 
-// proteção contra quedas
+// proteção
 process.on('uncaughtException', (e) => console.error('[client] uncaught', e));
 process.on('unhandledRejection', (e) => console.error('[client] unhandled', e));
