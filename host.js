@@ -1,6 +1,5 @@
-// host.js – recebe DataChannels e disca TCP via internet do Host.
+// host.js — recebe canais e disca TCP usando a internet do Host.
 // Execução: ROOM=demo1 SIGNAL=wss://signal.loghub.shop/ws node host.js
-
 const net = require('net');
 const WebSocket = require('ws');
 const wrtc = require('wrtc');
@@ -8,7 +7,7 @@ const wrtc = require('wrtc');
 const ROOM   = process.env.ROOM   || 'demo1';
 const SIGNAL = process.env.SIGNAL || 'wss://signal.loghub.shop/ws';
 
-// ATENÇÃO: mantenha as credenciais do seu TURN aqui (as mesmas do coturn)
+// Ajuste user/senha do seu TURN conforme seu coturn:
 const ICE = {
   iceServers: [
     { urls: 'stun:turn.loghub.shop:3478' },
@@ -19,33 +18,32 @@ const ICE = {
 
 let ws, pc;
 
-function newPeerConnection() {
+function makePC() {
   const pc = new wrtc.RTCPeerConnection(ICE);
 
   pc.oniceconnectionstatechange = () => console.log('[host] ICE:', pc.iceConnectionState);
   pc.onconnectionstatechange   = () => console.log('[host] PC :', pc.connectionState);
+
   pc.onicecandidate = ({ candidate }) => {
     if (candidate && ws && ws.readyState === 1) {
       ws.send(JSON.stringify({ type: 'signal', data: { candidate } }));
     }
   };
 
-  // Recebe canais
+  // Recebe DataChannels
   pc.ondatachannel = (ev) => {
     const dc = ev.channel;
     dc.binaryType = 'arraybuffer';
 
-    // Canal de controle (mantém a ligação viva)
-    if (dc.label === 'ctrl') {
-      dc.onmessage = () => {}; // pode responder ping/pong se quiser
+    if (dc.label === 'ctrl') { // keep-alive
+      dc.onmessage = () => {};
       return;
     }
 
-    // Qualquer outro canal: espera cabeçalho {type:'tcp-connect', host, port}
     let stage = 'header';
     let tcp = null;
 
-    const cleanup = () => { try { dc.close(); } catch {} try { tcp && tcp.destroy(); } catch {} };
+    const cleanup = () => { try{dc.close();}catch{}; try{tcp && tcp.destroy();}catch{} };
 
     dc.onmessage = (e) => {
       const buf = Buffer.from(e.data);
@@ -82,24 +80,20 @@ function newPeerConnection() {
 function start() {
   console.log('[host] START', { ROOM, SIGNAL });
   ws = new WebSocket(SIGNAL);
+  pc = makePC();
 
-  pc = newPeerConnection();
-
-  ws.on('open', () => {
-    ws.send(JSON.stringify({ type: 'join', role: 'host', room: ROOM }));
-  });
+  ws.on('open', () => ws.send(JSON.stringify({ type: 'join', role: 'host', room: ROOM })));
 
   ws.on('message', async (raw) => {
     let m; try { m = JSON.parse(raw); } catch { return; }
     if (m.type !== 'signal') return;
-
     const data = m.data || {};
     try {
       if (data.sdp) {
-        // Se o PC travar, recria antes de aceitar nova oferta
+        // se vier um novo OFFER enquanto não estamos estáveis, recria PC (simples e robusto)
         if (data.sdp.type === 'offer' && pc.signalingState !== 'stable') {
           try { pc.close(); } catch {}
-          pc = newPeerConnection();
+          pc = makePC();
         }
         await pc.setRemoteDescription(new wrtc.RTCSessionDescription(data.sdp));
         if (data.sdp.type === 'offer') {
@@ -108,9 +102,7 @@ function start() {
           ws.send(JSON.stringify({ type: 'signal', data: { sdp: pc.localDescription } }));
         }
       }
-      if (data.candidate) {
-        await pc.addIceCandidate(new wrtc.RTCIceCandidate(data.candidate));
-      }
+      if (data.candidate) await pc.addIceCandidate(new wrtc.RTCIceCandidate(data.candidate));
     } catch (e) {
       console.error('[host] sinalização erro:', e.message);
     }
