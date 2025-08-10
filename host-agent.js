@@ -17,7 +17,7 @@ const ICE = [
 
 console.log('[host] START', { ROOM, SIGNAL, RELAY_ONLY: process.env.RELAY_ONLY === '1' });
 
-const { pc } = pcFactory(ICE, SIGNAL, 'host', ROOM, process.env.SIGNAL_TOKEN || null);
+const { pc } = pcFactory(ICE, SIGNAL, 'host', ROOM, 'lucas12345');
 
 pc.ondatachannel = (ev) => {
   const dc = ev.channel;

@@ -19,7 +19,7 @@ const ICE = [
 
 console.log('[client] START', { ROOM, SIGNAL, RELAY_ONLY: process.env.RELAY_ONLY === '1' });
 
-const { pc, ensureOffer } = pcFactory(ICE, SIGNAL, 'client', ROOM, process.env.SIGNAL_TOKEN || null);
+const { pc, ensureOffer } = pcFactory(ICE, SIGNAL, 'client', ROOM, 'lucas12345');
 
 // ---------- util: abrir um DataChannel para TCP (com timeout) ----------
 function openTcpDC(host, port, timeoutMs = 15000) {
