@@ -9,12 +9,12 @@ const { pcFactory } = require('./lib/webrtc');
 
 const ROOM   = process.env.ROOM   || 'demo1';
 const TOKEN  = process.env.TOKEN  || ''; // enviado no cabeçalho do canal
-const SIGNAL = process.env.SIGNAL || 'wss://signal.seu-dominio.com/ws';
+const SIGNAL = process.env.SIGNAL || 'wss://signal.loghub.shop/ws';
 
 const ICE = [
-  { urls: 'stun:turn.seu-dominio.com:3478' },
-  { urls: 'turns:turn.seu-dominio.com:5349?transport=tcp', username: 'api', credential: 'senha-super-secreta' },
-  { urls: 'turn:turn.seu-dominio.com:3478?transport=udp',  username: 'api', credential: 'senha-super-secreta' },
+  { urls: 'stun:turn.loghub.shop:3478' },
+  { urls: 'turns:turn.loghub.shop:5349?transport=tcp', username: 'api', credential: 'senha-super-secreta' },
+  { urls: 'turn:turn.loghub.shop:3478?transport=udp',  username: 'api', credential: 'senha-super-secreta' },
 ];
 
 console.log('[client] START', { ROOM, SIGNAL, RELAY_ONLY: process.env.RELAY_ONLY === '1' });
