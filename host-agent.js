@@ -1,20 +1,23 @@
-const net = require('net');
+// host-agent.js
+// Roda na casa do B (Host). Recebe DataChannels e disca TCP/UDP pra internet local.
+// Env vars: ROOM, TOKEN, SIGNAL, SIGNAL_TOKEN, RELAY_ONLY
+const net   = require('net');
 const dgram = require('dgram');
 const { pcFactory } = require('./lib/webrtc');
 
 const ROOM   = process.env.ROOM   || 'demo1';
-const TOKEN  = process.env.TOKEN  || 'lucas12345';           // aceite apenas este token
+const TOKEN  = process.env.TOKEN  || 'lucas12345'; // token que o Client deve enviar no cabeçalho do canal
 const SIGNAL = process.env.SIGNAL || 'wss://signal.loghub.shop/ws';
+
 const ICE = [
   { urls: 'stun:turn.loghub.shop:3478' },
-  { urls: 'turns:turn.loghub.shop:5349?transport=tcp', username:'api', credential:'senha-super-secreta' },
-  { urls: 'turn:turn.loghub.shop:3478?transport=udp',  username:'api', credential:'senha-super-secreta' }
+  { urls: 'turns:turn.loghub.shop:5349?transport=tcp', username: 'api', credential: 'senha-super-secreta' },
+  { urls: 'turn:turn.loghub.shop:3478?transport=udp',  username: 'api', credential: 'senha-super-secreta' },
 ];
 
-const { pc } = pcFactory(ICE, SIGNAL, 'host', ROOM, process.env.SIGNAL_TOKEN || null);
+console.log('[host] START', { ROOM, SIGNAL, RELAY_ONLY: process.env.RELAY_ONLY === '1' });
 
-pc.oniceconnectionstatechange = () => console.log('ICE:', pc.iceConnectionState);
-pc.onconnectionstatechange = () => console.log('PC :', pc.connectionState);
+const { pc } = pcFactory(ICE, SIGNAL, 'host', ROOM, process.env.SIGNAL_TOKEN || null);
 
 pc.ondatachannel = (ev) => {
   const dc = ev.channel;
@@ -24,39 +27,72 @@ pc.ondatachannel = (ev) => {
   let tcp = null;
   let udpSock = null;
 
+  // util: fecha tudo com calma
+  const closeAll = () => {
+    try { dc.close(); } catch {}
+    try { tcp && tcp.destroy(); } catch {}
+    try { udpSock && udpSock.close(); } catch {}
+  };
+
   dc.onmessage = (e) => {
     const buf = Buffer.from(e.data);
+
     if (mode === 'header') {
       try {
         const h = JSON.parse(buf.toString('utf8'));
-        if (TOKEN && h.token !== TOKEN) { dc.send(Buffer.from([0])); return dc.close(); }
+        if (TOKEN && h.token !== TOKEN) {
+          console.warn('[host] token inválido');
+          try { dc.send(Buffer.from([0])); } catch {}
+          return closeAll();
+        }
 
         if (h.type === 'tcp-connect') {
-          tcp = net.connect({ host: h.host, port: Number(h.port) }, () => dc.send(Buffer.from([1])));
+          console.log('[host] tcp-connect =>', h.host, h.port);
+          tcp = net.connect({ host: h.host, port: Number(h.port) }, () => {
+            try { dc.send(Buffer.from([1])); } catch {}
+          });
+          tcp.setTimeout(15000, () => { // timeout de conexão/ocioso
+            console.warn('[host] tcp timeout');
+            try { dc.send(Buffer.from([0])); } catch {}
+            return closeAll();
+          });
           tcp.on('data', chunk => { try { dc.send(chunk); } catch {} });
-          tcp.on('error', () => { try{ dc.send(Buffer.from([0])); }catch{}; dc.close(); });
-          tcp.on('close', () => { try{ dc.close(); }catch{} });
+          tcp.on('error', err => { console.warn('[host] tcp error:', err.message); try { dc.send(Buffer.from([0])); } catch {} ; closeAll(); });
+          tcp.on('close', () => { try { dc.close(); } catch {} });
           mode = 'tcp';
+
         } else if (h.type === 'udp-assoc') {
-          udpSock = dgram.createSocket('udp4'); // simples; pode usar dual-stack se preciso
-          dc.send(Buffer.from([1]));
+          console.log('[host] udp-assoc');
+          udpSock = dgram.createSocket('udp4'); // simples (IPv4)
+          udpSock.on('message', (msg, rinfo) => {
+            // devolve pro cliente: {rhost,rport,data}
+            const payload = JSON.stringify({ rhost: rinfo.address, rport: rinfo.port, data: msg.toString('base64') });
+            try { dc.send(Buffer.from(payload)); } catch {}
+          });
+          try { dc.send(Buffer.from([1])); } catch {}
           mode = 'udp';
+
         } else {
-          dc.send(Buffer.from([0])); dc.close();
+          console.warn('[host] header desconhecido');
+          try { dc.send(Buffer.from([0])); } catch {}
+          return closeAll();
         }
-      } catch {
-        dc.send(Buffer.from([0])); dc.close();
+      } catch (err) {
+        console.warn('[host] header inválido');
+        try { dc.send(Buffer.from([0])); } catch {}
+        return closeAll();
       }
       return;
     }
 
     if (mode === 'tcp' && tcp) {
+      // bytes do cliente -> destino
       tcp.write(buf);
       return;
     }
 
     if (mode === 'udp' && udpSock) {
-      // mensagem é JSON {rhost, rport, data(base64)}
+      // JSON {rhost, rport, data(base64)} vindo do cliente
       try {
         const m = JSON.parse(buf.toString('utf8'));
         const data = Buffer.from(m.data, 'base64');
@@ -65,7 +101,10 @@ pc.ondatachannel = (ev) => {
     }
   };
 
-  dc.onclose = () => { try { tcp && tcp.destroy(); udpSock && udpSock.close(); } catch {} };
+  dc.onclose = closeAll;
+  dc.onerror = (e) => { console.warn('[host] dc error:', e && e.message); closeAll(); };
 };
 
-console.log('Host pronto. ROOM=', ROOM);
+// proteção contra quedas
+process.on('uncaughtException', (e) => console.error('[host] uncaught', e));
+process.on('unhandledRejection', (e) => console.error('[host] unhandled', e));
