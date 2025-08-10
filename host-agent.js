@@ -1,12 +1,11 @@
 // host-agent.js
 // Roda na casa do B (Host). Recebe DataChannels e disca TCP/UDP pra internet local.
-// Env vars: ROOM, TOKEN, SIGNAL, SIGNAL_TOKEN, RELAY_ONLY
 const net   = require('net');
 const dgram = require('dgram');
 const { pcFactory } = require('./lib/webrtc');
 
 const ROOM   = process.env.ROOM   || 'demo1';
-const TOKEN  = process.env.TOKEN  || 'lucas12345'; // token que o Client deve enviar no cabeçalho do canal
+const TOKEN  = process.env.TOKEN  || 'lucas12345'; // o Client deve enviar esse token no cabeçalho do canal
 const SIGNAL = process.env.SIGNAL || 'wss://signal.loghub.shop/ws';
 
 const ICE = [
@@ -27,7 +26,6 @@ pc.ondatachannel = (ev) => {
   let tcp = null;
   let udpSock = null;
 
-  // util: fecha tudo com calma
   const closeAll = () => {
     try { dc.close(); } catch {}
     try { tcp && tcp.destroy(); } catch {}
@@ -40,10 +38,12 @@ pc.ondatachannel = (ev) => {
     if (mode === 'header') {
       try {
         const h = JSON.parse(buf.toString('utf8'));
-        if (TOKEN && h.token !== TOKEN) {
-          console.warn('[host] token inválido');
-          try { dc.send(Buffer.from([0])); } catch {}
-          return closeAll();
+        if (h?.type === 'tcp-connect' || h?.type === 'udp-assoc') {
+          if (TOKEN && h.token !== TOKEN) {
+            console.warn('[host] token inválido');
+            try { dc.send(Buffer.from([0])); } catch {}
+            return closeAll();
+          }
         }
 
         if (h.type === 'tcp-connect') {
@@ -51,7 +51,7 @@ pc.ondatachannel = (ev) => {
           tcp = net.connect({ host: h.host, port: Number(h.port) }, () => {
             try { dc.send(Buffer.from([1])); } catch {}
           });
-          tcp.setTimeout(15000, () => { // timeout de conexão/ocioso
+          tcp.setTimeout(15000, () => {
             console.warn('[host] tcp timeout');
             try { dc.send(Buffer.from([0])); } catch {}
             return closeAll();
@@ -63,9 +63,8 @@ pc.ondatachannel = (ev) => {
 
         } else if (h.type === 'udp-assoc') {
           console.log('[host] udp-assoc');
-          udpSock = dgram.createSocket('udp4'); // simples (IPv4)
+          udpSock = dgram.createSocket('udp4');
           udpSock.on('message', (msg, rinfo) => {
-            // devolve pro cliente: {rhost,rport,data}
             const payload = JSON.stringify({ rhost: rinfo.address, rport: rinfo.port, data: msg.toString('base64') });
             try { dc.send(Buffer.from(payload)); } catch {}
           });
@@ -73,12 +72,14 @@ pc.ondatachannel = (ev) => {
           mode = 'udp';
 
         } else {
-          console.warn('[host] header desconhecido');
+          // Pode ser um DataChannel "control" do cliente (sem header).
+          // Ignore e feche, para não acumular canais.
+          console.log('[host] canal sem header conhecido; fechando');
           try { dc.send(Buffer.from([0])); } catch {}
           return closeAll();
         }
-      } catch (err) {
-        console.warn('[host] header inválido');
+      } catch {
+        console.warn('[host] header inválido; fechando canal');
         try { dc.send(Buffer.from([0])); } catch {}
         return closeAll();
       }
@@ -86,13 +87,11 @@ pc.ondatachannel = (ev) => {
     }
 
     if (mode === 'tcp' && tcp) {
-      // bytes do cliente -> destino
       tcp.write(buf);
       return;
     }
 
     if (mode === 'udp' && udpSock) {
-      // JSON {rhost, rport, data(base64)} vindo do cliente
       try {
         const m = JSON.parse(buf.toString('utf8'));
         const data = Buffer.from(m.data, 'base64');
@@ -105,6 +104,5 @@ pc.ondatachannel = (ev) => {
   dc.onerror = (e) => { console.warn('[host] dc error:', e && e.message); closeAll(); };
 };
 
-// proteção contra quedas
 process.on('uncaughtException', (e) => console.error('[host] uncaught', e));
 process.on('unhandledRejection', (e) => console.error('[host] unhandled', e));

@@ -1,14 +1,13 @@
 // client-agent.js
-// Roda no A (Cliente). Expõe HTTP CONNECT (127.0.0.1:8080) e SOCKS5 (127.0.0.1:1080)
-// e manda cada conexão por um DataChannel até o Host.
-// Env vars: ROOM, TOKEN, SIGNAL, SIGNAL_TOKEN, RELAY_ONLY
+// Expõe HTTP CONNECT (127.0.0.1:8080) e SOCKS5 (127.0.0.1:1080) e
+// encaminha via DataChannels. Negocia só uma vez.
 const net   = require('net');
 const dgram = require('dgram');
 const http  = require('http');
 const { pcFactory } = require('./lib/webrtc');
 
 const ROOM   = process.env.ROOM   || 'demo1';
-const TOKEN  = process.env.TOKEN  || 'lucas12345'; // enviado no cabeçalho do canal
+const TOKEN  = process.env.TOKEN  || 'lucas12345'; // enviado no cabeçalho dos canais
 const SIGNAL = process.env.SIGNAL || 'wss://signal.loghub.shop/ws';
 
 const ICE = [
@@ -19,11 +18,18 @@ const ICE = [
 
 console.log('[client] START', { ROOM, SIGNAL, RELAY_ONLY: process.env.RELAY_ONLY === '1' });
 
-const { pc, ensureOffer } = pcFactory(ICE, SIGNAL, 'client', ROOM, 'lucas12345');
+const { pc, ensureOffer, offeredOnce } = pcFactory(ICE, SIGNAL, 'client', ROOM, 'lucas12345');
 
-// ---------- util: abrir um DataChannel para TCP (com timeout) ----------
+// 1) Cria um canal "control" no boot para garantir m-line e manter SCTP aberto.
+const control = pc.createDataChannel('control', { ordered: true });
+control.onopen = () => console.log('[client] control: open');
+control.onclose = () => console.log('[client] control: close');
+// dispara oferta inicial se ainda não negociado
+ensureOffer().catch(()=>{});
+
+// ---------- util: abrir DataChannel TCP sem renegociar ----------
 function openTcpDC(host, port, timeoutMs = 15000) {
-  return new Promise(async (res, rej) => {
+  return new Promise((res, rej) => {
     const dc = pc.createDataChannel(`tcp-${Date.now()}`, { ordered: true });
     let timer = setTimeout(() => { try { dc.close(); } catch {} ; rej(new Error('timeout-dc-open')); }, timeoutMs);
     dc.binaryType = 'arraybuffer';
@@ -37,12 +43,11 @@ function openTcpDC(host, port, timeoutMs = 15000) {
     };
     dc.onmessage = first;
     dc.onerror = (err) => { clearTimeout(timer); rej(err); };
-    await ensureOffer();
   });
 }
 
 function openUdpAssocDC(timeoutMs = 15000) {
-  return new Promise(async (res, rej) => {
+  return new Promise((res, rej) => {
     const dc = pc.createDataChannel(`udp-${Date.now()}`, { ordered: true });
     let timer = setTimeout(() => { try { dc.close(); } catch {} ; rej(new Error('timeout-udp-assoc')); }, timeoutMs);
     dc.binaryType = 'arraybuffer';
@@ -54,7 +59,6 @@ function openUdpAssocDC(timeoutMs = 15000) {
     };
     dc.onmessage = first;
     dc.onerror = (err) => { clearTimeout(timer); rej(err); };
-    await ensureOffer();
   });
 }
 
@@ -85,19 +89,16 @@ httpProxy.listen(8080, '127.0.0.1', () => console.log('[client] HTTP CONNECT em 
 const socksServer = net.createServer(async (cliSock) => {
   cliSock.once('data', async (hello) => {
     if (hello[0] !== 0x05) { cliSock.destroy(); return; }
-    // NoAuth (MVP). Se quiser, implemente username/password (RFC 1929).
-    cliSock.write(Buffer.from([0x05, 0x00]));
+    cliSock.write(Buffer.from([0x05, 0x00])); // NoAuth
 
     cliSock.once('data', async (req1) => {
       const ver = req1[0], cmd = req1[1], atyp = req1[3];
       if (ver !== 0x05 || (cmd !== 0x01 && cmd !== 0x03)) {
-        // 0x01 CONNECT, 0x03 UDP ASSOC
-        cliSock.end(Buffer.from([0x05, 0x07, 0x00, 0x01, 0,0,0,0, 0,0]));
-        return;
+        cliSock.end(Buffer.from([0x05, 0x07, 0x00, 0x01, 0,0,0,0, 0,0])); return;
       }
 
       if (cmd === 0x01) {
-        // ------- CONNECT (TCP) -------
+        // CONNECT
         let host, port, p = 4;
         if (atyp === 0x01) { host = req1.slice(p, p+4).join('.'); p += 4; }
         else if (atyp === 0x03) { const len=req1[p]; p += 1; host = req1.slice(p, p+len).toString('utf8'); p += len; }
@@ -106,19 +107,18 @@ const socksServer = net.createServer(async (cliSock) => {
 
         try {
           const dc = await openTcpDC(host, port, 15000);
-          // success
           cliSock.write(Buffer.from([0x05, 0x00, 0x00, 0x01, 0,0,0,0, 0,0]));
           cliSock.on('data', chunk => { try { dc.send(chunk); } catch {} });
           cliSock.on('end',  () => { try { dc.close(); } catch {} });
           cliSock.on('error',() => { try { dc.close(); } catch {} });
           dc.onmessage = (e) => { try { cliSock.write(Buffer.from(e.data)); } catch {} };
           dc.onclose   = () => { try { cliSock.end(); } catch {} };
-        } catch (e) {
-          cliSock.end(Buffer.from([0x05, 0x01, 0x00, 0x01, 0,0,0,0, 0,0])); // general failure
+        } catch {
+          cliSock.end(Buffer.from([0x05, 0x01, 0x00, 0x01, 0,0,0,0, 0,0]));
         }
 
       } else if (cmd === 0x03) {
-        // ------- UDP ASSOCIATE -------
+        // UDP ASSOC
         try {
           const dc = await openUdpAssocDC(15000);
           const udpLocal = dgram.createSocket('udp4');
@@ -126,7 +126,6 @@ const socksServer = net.createServer(async (cliSock) => {
 
           udpLocal.on('message', (msg, rinfo) => {
             clientAddr = rinfo.address; clientPort = rinfo.port;
-            // RFC 1928: RSV(2) FRAG(1) ATYP(1) DST.ADDR DST.PORT DATA
             if (msg[2] !== 0x00) return; // sem fragmentação
             const atyp = msg[3];
             if (atyp === 0x01) {
@@ -140,8 +139,6 @@ const socksServer = net.createServer(async (cliSock) => {
               const port = (msg[5+len]<<8) | msg[6+len];
               const data = msg.slice(7+len);
               dc.send(Buffer.from(JSON.stringify({ rhost: host, rport: port, data: data.toString('base64') })));
-            } else {
-              // IPv6 não implementado no MVP
             }
           });
 
@@ -149,7 +146,6 @@ const socksServer = net.createServer(async (cliSock) => {
             try {
               const m = JSON.parse(Buffer.from(e.data).toString('utf8'));
               if (!clientAddr) return;
-              // Monta pacote SOCKS5-UDP de volta (usamos ATYP=domínio pra simplicidade)
               const hostBuf = Buffer.from(m.rhost, 'utf8');
               const hdr = Buffer.from([0x00,0x00,0x00, 0x03, hostBuf.length, ...hostBuf]);
               const portBuf = Buffer.from([ (m.rport>>8)&0xff, m.rport&0xff ]);
@@ -161,13 +157,12 @@ const socksServer = net.createServer(async (cliSock) => {
 
           udpLocal.bind(0, '127.0.0.1', () => {
             const addr = udpLocal.address();
-            // success: bound local UDP
             const rep = Buffer.from([0x05,0x00,0x00,0x01, 127,0,0,1, (addr.port>>8)&0xff, addr.port&0xff ]);
             cliSock.write(rep);
             cliSock.on('close', () => { try { udpLocal.close(); } catch {} ; try { dc.close(); } catch {} });
           });
 
-        } catch (e) {
+        } catch {
           cliSock.end(Buffer.from([0x05, 0x01, 0x00, 0x01, 0,0,0,0, 0,0]));
         }
       }
@@ -176,6 +171,6 @@ const socksServer = net.createServer(async (cliSock) => {
 });
 socksServer.listen(1080, '127.0.0.1', () => console.log('[client] SOCKS5 em 127.0.0.1:1080'));
 
-// proteção contra quedas
+// Proteção contra quedas
 process.on('uncaughtException', (e) => console.error('[client] uncaught', e));
 process.on('unhandledRejection', (e) => console.error('[client] unhandled', e));
